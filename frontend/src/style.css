@@ -586,6 +586,76 @@ h2 {
   }
 }
 
+/* File-workbench finish: calm canvas, explicit regions, and dense scanning. */
+:root {
+  color: #1d2928;
+  background: #eef1ef;
+}
+body {
+  background:
+    linear-gradient(90deg, rgba(255,255,255,.62) 1px, transparent 1px) 0 0 / 32px 32px,
+    #eef1ef;
+}
+.clean-shell {
+  width: min(1260px, calc(100% - 48px));
+  padding-top: 30px;
+}
+.clean-topbar {
+  margin-bottom: 20px;
+  padding: 18px 20px;
+  border: 1px solid #d8e0dc;
+  border-radius: 8px;
+  background: rgba(255,255,255,.88);
+  box-shadow: 0 5px 18px rgba(31, 48, 43, .06);
+}
+.clean-topbar h1 { color: #173f38; font-size: 30px; letter-spacing: 0; }
+.eyebrow, .section-label { color: #668078; letter-spacing: .1em; }
+.subtitle { color: #71807c; }
+.clean-actions { gap: 6px; }
+.account-chip { border-radius: 5px; color: #216054; background: #e7f3ef; }
+.upload-card, .clean-controls, .evidence-drawer, .clean-panel {
+  border-color: #d3ddd8;
+  border-radius: 7px;
+  box-shadow: 0 5px 16px rgba(31, 48, 43, .045);
+}
+.upload-card { background: #fff; }
+.upload-card-heading { padding-bottom: 12px; border-bottom: 1px solid #e5ebe8; }
+.clean-controls { background: #f9fbfa; }
+.analysis-layout { grid-template-columns: minmax(250px, .31fr) minmax(0, 1fr); gap: 14px; }
+.evidence-drawer { position: sticky; top: 16px; max-height: calc(100vh - 32px); padding: 17px; }
+.drawer-heading { padding-bottom: 12px; border-bottom: 1px solid #e5ebe8; }
+.drawer-heading > strong { color: #287b63; }
+.timeline-list { max-height: calc(100vh - 210px); padding-top: 2px; }
+.timeline-item { border: 1px solid #e1e9e5; border-left: 3px solid #9bb1a9; border-radius: 4px; background: #fbfcfc; }
+.timeline-item.is-cited { border-color: #ebd2b5; border-left-color: #d27a3d; background: #fff8ef; }
+.clean-panel { padding: 25px 28px 30px; background: rgba(255,255,255,.96); }
+.clean-heading { padding-bottom: 18px; border-bottom: 1px solid #e5ebe8; }
+.question-input { min-height: 112px; border-color: #cfdad5; background: #fbfcfc; }
+.question-input:focus, .text-input:focus { border-color: #32846d; box-shadow: 0 0 0 3px rgba(50,132,109,.13); }
+.primary-button { background: #176b59; box-shadow: 0 2px 4px rgba(23,107,89,.16); }
+.primary-button:hover:not(:disabled) { background: #125746; }
+.secondary-button, .upload-button { color: #216054; background: #e7f3ef; }
+.secondary-button:hover:not(:disabled), .upload-button:hover { background: #d9ece6; }
+.report-stream { margin-top: 20px; }
+.report-card-stream { border-color: #d6e0dc; border-radius: 6px; background: #fff; box-shadow: 0 3px 10px rgba(31,48,43,.035); }
+.stream-header h3 { color: #203a35; font-size: 18px; }
+.stream-header-side { align-items: flex-start; }
+.stream-toggle { padding-top: 5px; color: #287b63; }
+.stream-body { border-top-color: #e5ebe8; }
+.report-answer { color: #304440; font-size: 15px; }
+.report-section { border-top-color: #e5ebe8; }
+.report-evidence { border-left-color: #4f9a83; background: #f4f9f7; }
+.follow-up-card { border-left-color: #6c8d9a; background: #f1f6f7; }
+.inline-follow-up input { border-color: #cfdad5; background: #fbfcfc; }
+.progress-track span { background: linear-gradient(90deg, #63b298, #176b59); }
+
+@media (max-width: 760px) {
+  .clean-shell { width: min(100% - 24px, 620px); padding-top: 18px; }
+  .evidence-drawer { position: static; max-height: none; }
+  .timeline-list { max-height: 300px; }
+  .clean-panel { padding: 20px 16px 24px; }
+}
+
 /* The report-first surface keeps raw transcription out of the primary workflow. */
 .clean-shell { width: min(1180px, calc(100% - 40px)); }
 .clean-topbar, .clean-actions, .clean-controls, .clean-heading, .clean-ask-footer { display: flex; }
@@ -734,4 +804,35 @@ h2 {
   .clean-ask-footer .primary-button { width: 100%; }
   .inline-follow-up { align-items: stretch; flex-direction: column; }
   .inline-follow-up .secondary-button { align-self: stretch; }
+}
+
+/* Final workbench overrides stay last so legacy surface rules cannot undo them. */
+body { background: #eef1ef; }
+.clean-shell { width: min(1260px, calc(100% - 48px)); padding-top: 30px; }
+.clean-topbar { margin-bottom: 20px; padding: 18px 20px; border: 1px solid #d8e0dc; border-radius: 8px; background: rgba(255,255,255,.9); box-shadow: 0 5px 18px rgba(31,48,43,.06); }
+.clean-topbar h1 { color: #173f38; font-size: 30px; letter-spacing: 0; }
+.upload-card, .clean-controls, .evidence-drawer, .clean-panel { border-color: #d3ddd8; border-radius: 7px; box-shadow: 0 5px 16px rgba(31,48,43,.045); }
+.upload-card { background: #fff; }
+.analysis-layout { grid-template-columns: minmax(250px,.31fr) minmax(0,1fr); gap: 14px; }
+.evidence-drawer { position: sticky; top: 16px; max-height: calc(100vh - 32px); padding: 17px; }
+.timeline-list { max-height: calc(100vh - 210px); }
+.timeline-item { border: 1px solid #e1e9e5; border-left: 3px solid #9bb1a9; border-radius: 4px; background: #fbfcfc; }
+.timeline-item.is-cited { border-color: #ebd2b5; border-left-color: #d27a3d; background: #fff8ef; }
+.clean-panel { padding: 25px 28px 30px; background: rgba(255,255,255,.96); }
+.clean-heading { padding-bottom: 18px; border-bottom: 1px solid #e5ebe8; }
+.question-input { min-height: 112px; border-color: #cfdad5; background: #fbfcfc; }
+.primary-button { background: #176b59; box-shadow: 0 2px 4px rgba(23,107,89,.16); }
+.primary-button:hover:not(:disabled) { background: #125746; }
+.secondary-button, .upload-button { color: #216054; background: #e7f3ef; }
+.secondary-button:hover:not(:disabled), .upload-button:hover { background: #d9ece6; }
+.report-card-stream { border-color: #d6e0dc; border-radius: 6px; background: #fff; box-shadow: 0 3px 10px rgba(31,48,43,.035); }
+.stream-header h3 { color: #203a35; font-size: 18px; }
+.report-evidence { border-left-color: #4f9a83; background: #f4f9f7; }
+.follow-up-card { border-left-color: #6c8d9a; background: #f1f6f7; }
+
+@media (max-width: 760px) {
+  .clean-shell { width: min(100% - 24px, 620px); padding-top: 18px; }
+  .evidence-drawer { position: static; max-height: none; }
+  .timeline-list { max-height: 300px; }
+  .clean-panel { padding: 20px 16px 24px; }
 }

@@ -4,7 +4,6 @@ import hashlib
 import json
 import os
 import shutil
-import sqlite3
 import uuid
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
@@ -38,6 +37,7 @@ from .retrieval import (
     ensure_qdrant_collection,
     evidence_window,
     get_qdrant_client,
+    get_embedding_model,
     parse_time_hints,
     search_evidence,
     search_timeline,
@@ -59,6 +59,7 @@ from .storage import (
     get_session_summary,
     init_db,
     register_legacy_videos,
+    upsert_video,
     save_agent_turn,
     update_media_task,
     update_media_task as persist_media_task,
@@ -297,10 +298,11 @@ def _start_analysis_task(question: str, video_id: str | None, session_id: str) -
     """Create/deduplicate an initial-report task and dispatch the local worker."""
     with get_connection() as connection:
         active = connection.execute(
-            "SELECT * FROM media_tasks WHERE task_type = 'ANALYSIS' AND video_id IS ? "
+            "SELECT * FROM media_tasks WHERE task_type = 'ANALYSIS' "
+            "AND (video_id = ? OR (video_id IS NULL AND ? IS NULL)) "
             "AND question = ? AND state IN ('QUEUED', 'RUNNING') "
             "ORDER BY created_at DESC LIMIT 1",
-            (video_id, question),
+            (video_id, video_id, question),
         ).fetchone()
     if active:
         return _analysis_task_response(dict(active))
@@ -385,9 +387,17 @@ def _is_invalid_persisted_report(report_json: str | None) -> bool:
     raw = parse_kimi_json(report_json or "") or {}
     return not raw
 app = FastAPI(title="TraceLens", version="0.4.0")
+cors_origins = [
+    origin.strip()
+    for origin in os.getenv(
+        "CORS_ALLOW_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173",
+    ).split(",")
+    if origin.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -397,7 +407,6 @@ app.add_middleware(
 def startup() -> None:
     init_db()
     register_legacy_videos()
-    ensure_qdrant_collection()
     _resume_pending_analysis_tasks()
 
 
@@ -488,13 +497,12 @@ def _run_bilibili_import_task(task_id: str, bvid: str) -> dict[str, Any]:
         downloaded.path.unlink(missing_ok=True)
         raise ValueError(f"视频文件超过限制（最多 {max_bytes} bytes）")
     with get_connection() as connection:
-        connection.execute(
-            "INSERT INTO videos(video_id, filename, stored_path, content_hash, status, ocr_status) "
-            "VALUES (?, ?, ?, ?, 'UPLOADED', 'QUEUED') "
-            "ON CONFLICT(video_id) DO UPDATE SET filename=excluded.filename, stored_path=excluded.stored_path, "
-            "content_hash=excluded.content_hash, status=excluded.status, ocr_status=excluded.ocr_status, "
-            "updated_at=CURRENT_TIMESTAMP",
-            (bvid, downloaded.path.name, str(downloaded.path), hashlib.sha256(downloaded.path.read_bytes()).hexdigest()),
+        upsert_video(
+            connection,
+            {"video_id": bvid, "filename": downloaded.path.name, "stored_path": str(downloaded.path),
+             "content_hash": hashlib.sha256(downloaded.path.read_bytes()).hexdigest(),
+             "status": "UPLOADED", "ocr_status": "QUEUED"},
+            ["filename", "stored_path", "content_hash", "status", "ocr_status"],
         )
     result = _run_transcription_task(
         task_id,
@@ -611,11 +619,12 @@ def seed_demo(payload: DemoSeedIn, user: dict[str, Any] | None = Depends(optiona
     ]
     with get_connection() as connection:
         connection.execute("DELETE FROM evidence WHERE video_id = ?", (payload.video_id,))
-        connection.execute(
-            "INSERT INTO videos(video_id, filename, stored_path, content_hash, status, ocr_status) "
-            "VALUES (?, ?, '', ?, 'COMPLETED', 'DISABLED') "
-            "ON CONFLICT(video_id) DO UPDATE SET status='COMPLETED', updated_at=CURRENT_TIMESTAMP",
-            (payload.video_id, f"{payload.video_id}.demo.mp4", f"demo:{payload.video_id}"),
+        upsert_video(
+            connection,
+            {"video_id": payload.video_id, "filename": f"{payload.video_id}.demo.mp4",
+             "stored_path": "", "content_hash": f"demo:{payload.video_id}",
+             "status": "COMPLETED", "ocr_status": "DISABLED"},
+            ["status", "ocr_status"],
         )
         connection.executemany(
             "INSERT INTO evidence(video_id, start_seconds, end_seconds, text, source) VALUES (?, ?, ?, ?, 'ASR')",
@@ -745,7 +754,7 @@ async def upload_video(
         raise
 
     content_hash = digest.hexdigest()
-    existing: sqlite3.Row | None = None
+    existing: Any | None = None
     with get_connection() as connection:
         existing = connection.execute(
             "SELECT video_id, filename, stored_path, content_hash, ocr_status FROM videos WHERE video_id = ?",
@@ -784,19 +793,11 @@ async def upload_video(
         old_path = Path(existing["stored_path"]) if existing is not None else None
         temporary_path.replace(stored_path)
         with get_connection() as connection:
-            connection.execute(
-                """
-                INSERT INTO videos(video_id, filename, stored_path, content_hash, status, ocr_status)
-                VALUES (?, ?, ?, ?, 'UPLOADED', 'QUEUED')
-                ON CONFLICT(video_id) DO UPDATE SET
-                    filename = excluded.filename,
-                    stored_path = excluded.stored_path,
-                    content_hash = excluded.content_hash,
-                    status = excluded.status,
-                    ocr_status = excluded.ocr_status,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                (video_id, safe_name, str(stored_path), content_hash),
+            upsert_video(
+                connection,
+                {"video_id": video_id, "filename": safe_name, "stored_path": str(stored_path),
+                 "content_hash": content_hash, "status": "UPLOADED", "ocr_status": "QUEUED"},
+                ["filename", "stored_path", "content_hash", "status", "ocr_status"],
             )
         if old_path is not None and old_path != stored_path:
             old_path.unlink(missing_ok=True)
@@ -859,20 +860,12 @@ async def upload_video(
             "INSERT INTO evidence(video_id, start_seconds, end_seconds, text, source) VALUES (?, ?, ?, ?, ?)",
             evidence_rows,
         )
-        connection.execute(
-            """
-            INSERT INTO videos(video_id, filename, stored_path, content_hash, status, ocr_status, transcript_text)
-            VALUES (?, ?, ?, ?, 'COMPLETED', ?, ?)
-            ON CONFLICT(video_id) DO UPDATE SET
-                filename = excluded.filename,
-                stored_path = excluded.stored_path,
-                content_hash = excluded.content_hash,
-                status = excluded.status,
-                transcript_text = excluded.transcript_text,
-                ocr_status = excluded.ocr_status,
-                updated_at = CURRENT_TIMESTAMP
-            """,
-            (video_id, safe_name, str(stored_path), content_hash, ocr_status, "\n".join(item[2] for item in transcript)),
+        upsert_video(
+            connection,
+            {"video_id": video_id, "filename": safe_name, "stored_path": str(stored_path),
+             "content_hash": content_hash, "status": "COMPLETED", "ocr_status": ocr_status,
+             "transcript_text": "\n".join(item[2] for item in transcript)},
+            ["filename", "stored_path", "content_hash", "status", "ocr_status", "transcript_text"],
         )
     if old_path is not None and old_path != stored_path:
         old_path.unlink(missing_ok=True)
@@ -1247,8 +1240,14 @@ def get_metrics() -> dict[str, Any]:
         )
     
     qdrant_active = get_qdrant_client() is not None
-    embedding_model = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    embedding_backend = os.getenv("EMBEDDING_BACKEND", "sentence-transformers").strip().lower()
+    embedding_model = (
+        os.getenv("EMBEDDING_MODEL_REPO", "Xenova/bge-small-zh-v1.5")
+        if embedding_backend in {"onnx", "bge-onnx", "local-onnx"}
+        else os.getenv("EMBEDDING_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+    )
     embedding_enabled = env_flag("EMBEDDING_ENABLED", False)
+    embedding_available = embedding_enabled and get_embedding_model() is not None
     
     return {
         "agent_version": "0.5.0",
@@ -1269,8 +1268,8 @@ def get_metrics() -> dict[str, Any]:
             "avg_evidence_per_video": round(avg_evidence_per_video, 2),
         },
         "components": {
-            "vector_database": "qdrant" if qdrant_active and embedding_enabled else "disabled",
-            "embedding_model": embedding_model if embedding_enabled else "disabled",
+            "vector_database": "qdrant" if qdrant_active and embedding_available else "disabled",
+            "embedding_model": embedding_model if embedding_available else "unavailable",
             "agent_framework": "structured-langgraph" if kimi_is_configured() else "deterministic-fallback",
             "agent_workflow": os.getenv("DEEPSEEK_AGENT_WORKFLOW", os.getenv("KIMI_AGENT_WORKFLOW", "structured")),
             "transcription": "faster-whisper" if ocr_runner._WHISPER_MODEL is not None else "available on upload",

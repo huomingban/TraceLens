@@ -1,249 +1,238 @@
-"""SQLite persistence for evidence, media resources, and Agent sessions."""
+"""Database persistence for evidence, media resources, and Agent sessions.
+
+The application uses a small compatibility wrapper while the older API modules
+are migrated away from positional SQL. SQLAlchemy owns the connection,
+transactions, and dialect selection; existing callers can keep using
+``row["column"]`` and ``?`` parameters during the transition.
+"""
 from __future__ import annotations
 import hashlib
 import json
 import re
-import sqlite3
 import uuid
+from contextlib import contextmanager
+from collections.abc import Mapping, Iterator
 from pathlib import Path
 from typing import Any
 from fastapi import HTTPException
-from .config import DB_PATH, UPLOADS_DIR
+from sqlalchemy import (
+    Boolean, Column, DateTime, Float, ForeignKey, Integer, MetaData, String,
+    Table, Text, create_engine, func,
+)
+from sqlalchemy.dialects.mysql import LONGTEXT
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.sql import text
+from .config import DATABASE_URL, DB_PATH, UPLOADS_DIR, env_flag
 from .models import Evidence
 
-def ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
-    columns = {
-        row[1] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
-    }
-    if column not in columns:
-        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-def get_connection() -> sqlite3.Connection:
-    connection = sqlite3.connect(DB_PATH)
-    connection.row_factory = sqlite3.Row
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL UNIQUE,
-            password_hash TEXT NOT NULL,
-            role TEXT NOT NULL DEFAULT 'USER',
-            is_active INTEGER NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+metadata = MetaData()
+users = Table(
+    "users", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("username", String(255), nullable=False, unique=True),
+    Column("password_hash", String(255), nullable=False),
+    Column("role", String(32), nullable=False, server_default="USER"),
+    Column("is_active", Boolean, nullable=False, server_default="1"),
+    Column("created_at", DateTime, nullable=False, server_default=func.now()),
+)
+video_owners = Table(
+    "video_owners", metadata,
+    Column("video_id", String(255), primary_key=True),
+    Column("user_id", Integer, ForeignKey("users.id"), nullable=False),
+    Column("created_at", DateTime, nullable=False, server_default=func.now()),
+)
+evidence = Table(
+    "evidence", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("video_id", String(255), nullable=False),
+    Column("start_seconds", Float, nullable=False),
+    Column("end_seconds", Float, nullable=False),
+    Column("text", Text, nullable=False),
+    Column("source", String(32), nullable=False, server_default="ASR"),
+)
+videos = Table(
+    "videos", metadata,
+    Column("video_id", String(255), primary_key=True),
+    Column("filename", String(255), nullable=False),
+    Column("stored_path", String(1024), nullable=False),
+    Column("content_hash", String(64), nullable=False),
+    Column("status", String(32), nullable=False, server_default="COMPLETED"),
+    Column("ocr_status", String(32), nullable=False, server_default="UNKNOWN"),
+    Column("transcript_text", Text, nullable=True),
+    Column("created_at", DateTime, nullable=False, server_default=func.now()),
+    Column("updated_at", DateTime, nullable=False, server_default=func.now()),
+)
+agent_sessions = Table(
+    "agent_sessions", metadata,
+    Column("session_id", String(100), primary_key=True),
+    Column("video_id", String(255), nullable=True),
+    Column("title", String(255), nullable=True),
+    Column("summary", Text, nullable=True),
+    Column("created_at", DateTime, nullable=False, server_default=func.now()),
+    Column("updated_at", DateTime, nullable=False, server_default=func.now()),
+)
+agent_messages = Table(
+    "agent_messages", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("session_id", String(100), ForeignKey("agent_sessions.session_id"), nullable=False),
+    Column("role", String(32), nullable=False),
+    Column("content", Text, nullable=False),
+    Column("created_at", DateTime, nullable=False, server_default=func.now()),
+)
+agent_reports = Table(
+    "agent_reports", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("session_id", String(100), ForeignKey("agent_sessions.session_id"), nullable=False),
+    Column("question", Text, nullable=False),
+    Column("answer", Text, nullable=False),
+    Column("answerable", Boolean, nullable=False),
+    Column("support_level", String(32), nullable=False),
+    Column("report_json", Text().with_variant(LONGTEXT(), "mysql"), nullable=False),
+    Column("trace_json", Text().with_variant(LONGTEXT(), "mysql"), nullable=True),
+    Column("report_type", String(32), nullable=False, server_default="INITIAL"),
+    Column("parent_report_id", Integer, nullable=True),
+    Column("created_at", DateTime, nullable=False, server_default=func.now()),
+)
+media_tasks = Table(
+    "media_tasks", metadata,
+    Column("task_id", String(100), primary_key=True),
+    Column("video_id", String(255), nullable=False),
+    Column("task_type", String(32), nullable=False),
+    Column("state", String(32), nullable=False, server_default="QUEUED"),
+    Column("progress_current", Integer, nullable=False, server_default="0"),
+    Column("progress_total", Integer, nullable=False, server_default="0"),
+    Column("progress_message", Text, nullable=True),
+    Column("result_json", Text().with_variant(LONGTEXT(), "mysql"), nullable=True),
+    Column("error", Text, nullable=True),
+    Column("question", Text, nullable=True),
+    Column("session_id", String(100), nullable=True),
+    Column("created_at", DateTime, nullable=False, server_default=func.now()),
+    Column("started_at", DateTime, nullable=True),
+    Column("finished_at", DateTime, nullable=True),
+    Column("updated_at", DateTime, nullable=False, server_default=func.now()),
+)
+
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    pool_recycle=1800,
+    connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {},
+)
+
+
+class CompatRow(Mapping[str, Any]):
+    """SQLAlchemy Row with the old sqlite3.Row indexing behavior."""
+
+    def __init__(self, row: Any):
+        self._row = row
+        self._mapping = row._mapping
+
+    def __getitem__(self, key: str | int) -> Any:
+        return self._row[key] if isinstance(key, int) else self._mapping[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._mapping)
+
+    def __len__(self) -> int:
+        return len(self._mapping)
+
+    def keys(self):
+        return self._mapping.keys()
+
+
+class CompatResult:
+    def __init__(self, result: Any):
+        self._result = result
+        self.lastrowid = getattr(result, "lastrowid", None)
+        if self.lastrowid is None:
+            try:
+                self.lastrowid = result.inserted_primary_key[0]
+            except Exception:
+                pass
+
+    def fetchone(self) -> CompatRow | None:
+        row = self._result.fetchone()
+        return CompatRow(row) if row is not None else None
+
+    def fetchall(self) -> list[CompatRow]:
+        return [CompatRow(row) for row in self._result.fetchall()]
+
+
+class ConnectionAdapter:
+    def __init__(self, connection: Any):
+        self._connection = connection
+
+    @property
+    def sa_connection(self) -> Any:
+        return self._connection
+
+    @property
+    def dialect_name(self) -> str:
+        return self._connection.dialect.name
+
+    @staticmethod
+    def _bind(sql: str, params: Any) -> tuple[Any, dict[str, Any]]:
+        if isinstance(params, dict):
+            return text(sql), params
+        values = tuple(params or ())
+        index = 0
+        output: list[str] = []
+        for character in sql:
+            if character == "?":
+                name = f"p{index}"
+                output.append(f":{name}")
+                index += 1
+            else:
+                output.append(character)
+        if index != len(values):
+            raise ValueError(f"SQL parameter count mismatch: expected {index}, got {len(values)}")
+        return text("".join(output)), {f"p{i}": value for i, value in enumerate(values)}
+
+    def execute(self, sql: str, params: Any = None) -> CompatResult:
+        statement, bound = self._bind(sql, params)
+        return CompatResult(self._connection.execute(statement, bound))
+
+    def executemany(self, sql: str, params_list: list[tuple[Any, ...]]) -> CompatResult:
+        statement, _ = self._bind(sql, params_list[0] if params_list else ())
+        values = []
+        for params in params_list:
+            _, bound = self._bind(sql, params)
+            values.append(bound)
+        return CompatResult(self._connection.execute(statement, values))
+
+
+@contextmanager
+def get_connection() -> Iterator[ConnectionAdapter]:
+    with engine.begin() as connection:
+        yield ConnectionAdapter(connection)
+
+
+def upsert_video(connection: ConnectionAdapter, values: dict[str, Any], update_columns: list[str]) -> None:
+    """Insert or update a video using the active database dialect."""
+    if connection.dialect_name == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert
+        statement = insert(videos).values(**values)
+        statement = statement.on_conflict_do_update(
+            index_elements=[videos.c.video_id],
+            set_={column: getattr(statement.excluded, column) for column in update_columns},
         )
-        """
-    )
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS video_owners (
-            video_id TEXT PRIMARY KEY,
-            user_id INTEGER NOT NULL,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    else:
+        from sqlalchemy.dialects.mysql import insert
+        statement = insert(videos).values(**values)
+        statement = statement.on_duplicate_key_update(
+            **{column: getattr(statement.inserted, column) for column in update_columns}
         )
-        """
-    )
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS evidence (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            video_id TEXT NOT NULL,
-            start_seconds REAL NOT NULL,
-            end_seconds REAL NOT NULL,
-            text TEXT NOT NULL,
-            source TEXT NOT NULL DEFAULT 'ASR'
-        )
-        """
-    )
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS videos (
-            video_id TEXT PRIMARY KEY,
-            filename TEXT NOT NULL,
-            stored_path TEXT NOT NULL,
-            content_hash TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'COMPLETED',
-            ocr_status TEXT NOT NULL DEFAULT 'UNKNOWN',
-            transcript_text TEXT,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS agent_sessions (
-            session_id TEXT PRIMARY KEY,
-            video_id TEXT,
-            title TEXT,
-            summary TEXT,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS agent_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            role TEXT NOT NULL,
-            content TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(session_id) REFERENCES agent_sessions(session_id)
-        )
-        """
-    )
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS agent_reports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            question TEXT NOT NULL,
-            answer TEXT NOT NULL,
-            answerable INTEGER NOT NULL,
-            support_level TEXT NOT NULL,
-            report_json TEXT NOT NULL,
-            trace_json TEXT,
-            report_type TEXT NOT NULL DEFAULT 'INITIAL',
-            parent_report_id INTEGER,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(session_id) REFERENCES agent_sessions(session_id)
-        )
-        """
-    )
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS media_tasks (
-            task_id TEXT PRIMARY KEY,
-            video_id TEXT NOT NULL,
-            task_type TEXT NOT NULL,
-            state TEXT NOT NULL DEFAULT 'QUEUED',
-            progress_current INTEGER NOT NULL DEFAULT 0,
-            progress_total INTEGER NOT NULL DEFAULT 0,
-            progress_message TEXT,
-            result_json TEXT,
-            error TEXT,
-            question TEXT,
-            session_id TEXT,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            started_at TEXT,
-            finished_at TEXT,
-            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-    # Keep databases created by earlier versions compatible with the current schema.
-    ensure_column(connection, "evidence", "source", "TEXT NOT NULL DEFAULT 'ASR'")
-    ensure_column(connection, "videos", "ocr_status", "TEXT NOT NULL DEFAULT 'UNKNOWN'")
-    ensure_column(connection, "agent_sessions", "title", "TEXT")
-    ensure_column(connection, "agent_sessions", "summary", "TEXT")
-    ensure_column(connection, "agent_reports", "report_type", "TEXT NOT NULL DEFAULT 'INITIAL'")
-    ensure_column(connection, "agent_reports", "parent_report_id", "INTEGER")
-    ensure_column(connection, "media_tasks", "question", "TEXT")
-    ensure_column(connection, "media_tasks", "session_id", "TEXT")
-    return connection
+    connection.sa_connection.execute(statement)
 
 
 def init_db() -> None:
-    with get_connection() as connection:
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT NOT NULL UNIQUE,
-                password_hash TEXT NOT NULL,
-                role TEXT NOT NULL DEFAULT 'USER',
-                is_active INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS video_owners (
-                video_id TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS evidence (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                video_id TEXT NOT NULL,
-                start_seconds REAL NOT NULL,
-                end_seconds REAL NOT NULL,
-                text TEXT NOT NULL,
-                source TEXT NOT NULL DEFAULT 'ASR'
-            )
-        """
-        )
+    """Create a local schema when explicitly allowed.
 
-        ensure_column(connection, "evidence", "source", "TEXT NOT NULL DEFAULT 'ASR'")
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS agent_sessions (
-                session_id TEXT PRIMARY KEY,
-                video_id TEXT,
-                title TEXT,
-                summary TEXT,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        ensure_column(connection, "agent_sessions", "summary", "TEXT")
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS agent_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(session_id) REFERENCES agent_sessions(session_id)
-            )
-            """
-        )
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS agent_reports (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                question TEXT NOT NULL,
-                answer TEXT NOT NULL,
-                answerable INTEGER NOT NULL,
-                support_level TEXT NOT NULL,
-                report_json TEXT NOT NULL,
-                trace_json TEXT,
-                report_type TEXT NOT NULL DEFAULT 'INITIAL',
-                parent_report_id INTEGER,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(session_id) REFERENCES agent_sessions(session_id)
-            )
-            """
-        )
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS media_tasks (
-                task_id TEXT PRIMARY KEY,
-                video_id TEXT NOT NULL,
-                task_type TEXT NOT NULL,
-                state TEXT NOT NULL DEFAULT 'QUEUED',
-                progress_current INTEGER NOT NULL DEFAULT 0,
-                progress_total INTEGER NOT NULL DEFAULT 0,
-                progress_message TEXT,
-                result_json TEXT,
-            error TEXT,
-            question TEXT,
-            session_id TEXT,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                started_at TEXT,
-                finished_at TEXT,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
+    Production uses ``alembic upgrade head`` and sets AUTO_CREATE_SCHEMA=false.
+    Keeping this local fallback makes the existing SQLite test workflow simple.
+    """
+    if DATABASE_URL.startswith("sqlite") and env_flag("AUTO_CREATE_SCHEMA", True):
+        metadata.create_all(engine)
 
 
 def create_user(username: str, password_hash: str) -> dict[str, Any]:
@@ -253,7 +242,7 @@ def create_user(username: str, password_hash: str) -> dict[str, Any]:
                 "INSERT INTO users(username, password_hash) VALUES (?, ?)",
                 (username, password_hash),
             )
-        except sqlite3.IntegrityError as error:
+        except IntegrityError as error:
             raise ValueError("username already exists") from error
         return {"id": cursor.lastrowid, "username": username, "role": "USER", "is_active": True}
 

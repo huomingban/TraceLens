@@ -15,16 +15,24 @@ except Exception:  # pragma: no cover
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DB_PATH = Path(os.getenv("VIDEO_EVIDENCE_DB_PATH", str(PROJECT_ROOT / "data" / "agent.sqlite3"))).resolve()
-UPLOADS_DIR = Path(os.getenv("VIDEO_EVIDENCE_UPLOADS_DIR", str(PROJECT_ROOT / "data" / "uploads"))).resolve()
-LOCAL_QDRANT_DIR = Path(os.getenv("VIDEO_EVIDENCE_QDRANT_DIR", str(PROJECT_ROOT / "data" / "qdrant"))).resolve()
 ENV_PATH = PROJECT_ROOT / "backend" / ".env"
-
-for directory in (DB_PATH.parent, UPLOADS_DIR, LOCAL_QDRANT_DIR):
-    directory.mkdir(parents=True, exist_ok=True)
 
 if load_dotenv is not None:
     load_dotenv(ENV_PATH)
+
+# VIDEO_EVIDENCE_DB_PATH is deliberately an explicit local-test override.
+# Otherwise DATABASE_URL is the source of truth for persistent storage.
+DB_PATH = Path(os.getenv("VIDEO_EVIDENCE_DB_PATH", str(PROJECT_ROOT / "data" / "agent.sqlite3"))).resolve()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+if os.getenv("VIDEO_EVIDENCE_DB_PATH"):
+    DATABASE_URL = f"sqlite:///{DB_PATH.as_posix()}"
+elif not DATABASE_URL:
+    DATABASE_URL = f"sqlite:///{DB_PATH.as_posix()}"
+UPLOADS_DIR = Path(os.getenv("VIDEO_EVIDENCE_UPLOADS_DIR", str(PROJECT_ROOT / "data" / "uploads"))).resolve()
+LOCAL_QDRANT_DIR = Path(os.getenv("VIDEO_EVIDENCE_QDRANT_DIR", str(PROJECT_ROOT / "data" / "qdrant"))).resolve()
+
+for directory in (DB_PATH.parent, UPLOADS_DIR, LOCAL_QDRANT_DIR):
+    directory.mkdir(parents=True, exist_ok=True)
 
 logger = logging.getLogger("tracelens")
 

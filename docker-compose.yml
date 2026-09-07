@@ -1,0 +1,167 @@
+# Complete local/production-like TraceLens stack.  The only browser-facing
+# service is `web` on port 8080; all other services communicate on the private
+# Compose network.  Put real secrets in backend/.env (never commit that file).
+name: tracelens
+
+x-backend-env: &backend-env
+  DATABASE_URL: mysql+pymysql://root:${MYSQL_ROOT_PASSWORD:-root}@mysql:3306/${MYSQL_DATABASE:-tracelens}?charset=utf8mb4
+  AUTO_CREATE_SCHEMA: "false"
+  REDIS_URL: redis://redis:6379/0
+  QDRANT_HOST: qdrant
+  QDRANT_PORT: "6333"
+  QDRANT_IN_MEMORY: "false"
+  ROCKETMQ_NAMESERVER: rocketmq-namesrv:9876
+  ROCKETMQ_TOPIC: tracelens-video-tasks
+  ROCKETMQ_ENABLED: "true"
+  ROCKETMQ_PRODUCER_GROUP: tracelens-python-producer
+  ROCKETMQ_CONSUMER_GROUP: tracelens-python-consumer
+  VIDEO_EVIDENCE_UPLOADS_DIR: /app/data/uploads
+  VIDEO_EVIDENCE_QDRANT_DIR: /app/data/qdrant
+  EMBEDDING_MODEL_ROOT: /app/data/models/embeddings
+  EMBEDDING_BACKEND: onnx
+  EMBEDDING_ENABLED: "true"
+  EVIDENCE_RETRIEVER_PROFILE: coverage-aware-qdrant-hybrid-v2
+  EMBEDDING_MODEL_REPO: Xenova/bge-small-zh-v1.5
+  EMBEDDING_MODEL_REVISION: 75c43b069aac4d136ba6bc1122f995fedcfd2781
+  EMBEDDING_MODEL_FILE: onnx/model_quantized.onnx
+  EMBEDDING_ALLOW_DOWNLOAD: "true"
+  WHISPER_MODEL_ROOT: /app/data/models/whisper
+  PADDLEOCR_MODEL_ROOT: /app/data/models/paddlex
+  PADDLE_HOME: /app/data/models/paddle
+  CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-http://localhost:8080,http://127.0.0.1:8080}
+
+services:
+  mysql:
+    image: ${DOCKER_IMAGE_REGISTRY:-docker.m.daocloud.io}/library/mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-tracelens}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    # 3307 avoids colliding with the user's current native MySQL on 3306.
+    ports:
+      - "3307:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -p$$MYSQL_ROOT_PASSWORD"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+
+  redis:
+    image: ${DOCKER_IMAGE_REGISTRY:-docker.m.daocloud.io}/library/redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "7000:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  qdrant:
+    image: ${DOCKER_IMAGE_REGISTRY:-docker.m.daocloud.io}/qdrant/qdrant:v1.18.3
+    restart: unless-stopped
+    ports:
+      - "7001:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  rocketmq-namesrv:
+    image: ${DOCKER_IMAGE_REGISTRY:-docker.m.daocloud.io}/apache/rocketmq:4.9.4
+    restart: unless-stopped
+    command: sh mqnamesrv
+
+  rocketmq-broker:
+    image: ${DOCKER_IMAGE_REGISTRY:-docker.m.daocloud.io}/apache/rocketmq:4.9.4
+    restart: unless-stopped
+    command: sh mqbroker -n rocketmq-namesrv:9876
+    environment:
+      NAMESRV_ADDR: rocketmq-namesrv:9876
+    depends_on:
+      - rocketmq-namesrv
+
+  migrate:
+    build:
+      context: ./backend
+      args:
+        IMAGE_REGISTRY: ${DOCKER_IMAGE_REGISTRY:-docker.m.daocloud.io}
+        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-mirrors.aliyun.com}
+    env_file:
+      - ./backend/.env
+    environment: *backend-env
+    command: python -m alembic upgrade head
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build:
+      context: ./backend
+      args:
+        IMAGE_REGISTRY: ${DOCKER_IMAGE_REGISTRY:-docker.m.daocloud.io}
+        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-mirrors.aliyun.com}
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env
+    environment: *backend-env
+    command: uvicorn tracelens.main:app --host 0.0.0.0 --port 9090
+    volumes:
+      - app_data:/app/data
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      rocketmq-broker:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9090/api/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  worker:
+    build:
+      context: ./backend
+      args:
+        IMAGE_REGISTRY: ${DOCKER_IMAGE_REGISTRY:-docker.m.daocloud.io}
+        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-mirrors.aliyun.com}
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env
+    environment: *backend-env
+    command: python -m tracelens.worker
+    volumes:
+      - app_data:/app/data
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rocketmq-broker:
+        condition: service_started
+      qdrant:
+        condition: service_started
+    mem_limit: 2560m
+
+  web:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE: ""
+        IMAGE_REGISTRY: ${DOCKER_IMAGE_REGISTRY:-docker.m.daocloud.io}
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  mysql_data:
+  qdrant_data:
+  app_data:

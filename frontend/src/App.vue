@@ -412,7 +412,7 @@ async function ask() {
   await submitQuestion(question.value.trim(), null);
 }
 
-async function submitQuestion(text, reportSessionId) {
+async function submitQuestion(text, reportSessionId, { preserveScroll = false } = {}) {
   if (!text) return;
   if (transcriptionTask.value && transcriptionTask.value.state !== "COMPLETED") {
     message.value = "视频仍在转录，请等待任务完成后再提问。";
@@ -421,7 +421,7 @@ async function submitQuestion(text, reportSessionId) {
   loading.value = true;
   loadingMessage.value = "正在检索筛选证据并请求 DeepSeek...";
   message.value = "";
-  await scrollToReports();
+  if (!preserveScroll) await scrollToReports();
   try {
     const response = reportSessionId
       ? await api.ask(text, videoId.value, reportSessionId)
@@ -513,7 +513,7 @@ async function submitFollowUp(report) {
   await nextTick();
   document.getElementById(`follow-up-${report.id}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
   try {
-    await submitQuestion(text, report.session_id);
+    await submitQuestion(text, report.session_id, { preserveScroll: true });
     expandedReportId.value = report.id;
     followUpDrafts.value = { ...followUpDrafts.value, [report.id]: "" };
     await nextTick();
@@ -662,7 +662,7 @@ onBeforeUnmount(() => {
             <p>{{ item.text }}</p>
           </article>
         </div>
-        <p v-else class="empty-state">还没有证据。请先选择视频并上传转录，或准备演示数据。</p>
+        <p v-else class="empty-state">还没有证据。请先选择视频并上传或导入视频。</p>
       </aside>
 
       <section class="answer-panel">
@@ -777,7 +777,6 @@ onBeforeUnmount(() => {
         <span v-if="authUser" class="account-chip">{{ authUser.username }}</span>
         <button v-if="authUser" class="secondary-button" @click="logout">退出</button>
         <button v-else class="secondary-button" @click="openAuth()">登录 / 注册</button>
-        <button class="secondary-button" :disabled="loading" @click="seedDemo">准备演示数据</button>
       </div>
     </header>
 

@@ -1,4 +1,11 @@
-const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:9090";
+// In local Vite development there is no proxy, so the API defaults to 9090.
+// The production Nginx image sets VITE_API_BASE to an empty string, making
+// requests same-origin (for example, /api/videos) and avoiding a public API
+// port or a browser CORS dependency.
+const configuredApiBase = import.meta.env.VITE_API_BASE;
+const API_BASE = configuredApiBase === undefined
+  ? "http://127.0.0.1:9090"
+  : configuredApiBase.replace(/\/$/, "");
 
 async function readResponse(response, fallbackMessage) {
   const contentType = response.headers.get("content-type") || "";

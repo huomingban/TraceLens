@@ -8,10 +8,17 @@ python-dotenv>=1.0,<2
 redis>=5,<7
 sqlalchemy>=2,<3
 pymysql>=1.1,<2
+alembic>=1.14,<2
 mcp>=1.0,<2
 opencc-python-reimplemented>=0.1.7,<1
 qdrant-client>=1.12,<2
-sentence-transformers>=3,<7
+numpy>=1.26,<3
+onnxruntime>=1.18,<2
+tokenizers>=0.20,<1
+huggingface-hub>=0.26,<1
+# The default Docker runtime uses the smaller ONNX BGE backend above.
+# Install requirements-legacy-embeddings.txt only when the legacy
+# SentenceTransformer backend is explicitly selected.
 langgraph>=0.2,<2
 faster-whisper>=1.0,<2
 yt-dlp>=2025.1,<2027

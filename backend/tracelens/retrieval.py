@@ -6,6 +6,7 @@ import re
 import socket
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol
 try:
     from qdrant_client import QdrantClient
@@ -15,7 +16,7 @@ try:
     from sentence_transformers import SentenceTransformer
 except Exception:
     SentenceTransformer = None
-from .config import LOCAL_QDRANT_DIR, env_flag, logger
+from .config import LOCAL_QDRANT_DIR, PROJECT_ROOT, env_flag, logger
 from .models import Evidence
 from .storage import get_connection
 
@@ -48,7 +49,10 @@ class EvidenceRetriever:
 
     @staticmethod
     def terms(value: str) -> set[str]:
-        normalized = re.sub(r"\s+", "", str(value).lower())
+        normalized = str(value).lower()
+        # Keep ASCII word boundaries. Removing all whitespace turns a query
+        # such as "project retrieval" into one artificial token and makes
+        # English transcript retrieval silently fail.
         terms = set(re.findall(r"[a-z0-9_]{2,}", normalized))
         chinese = "".join(re.findall(r"[\u4e00-\u9fff]", normalized))
         terms.update(chinese[index:index + 2] for index in range(max(0, len(chinese) - 1)))
@@ -185,15 +189,54 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
 
 def get_embedding_model() -> Any | None:
     global _EMBEDDING_MODEL, _EMBEDDING_LOAD_FAILED
-    if not env_flag("EMBEDDING_ENABLED", False) or SentenceTransformer is None or _EMBEDDING_LOAD_FAILED:
+    if not env_flag("EMBEDDING_ENABLED", False) or _EMBEDDING_LOAD_FAILED:
         return None
     if _EMBEDDING_MODEL is None:
         try:
+            backend = os.getenv("EMBEDDING_BACKEND", "sentence-transformers").strip().lower()
+            if backend in {"onnx", "bge-onnx", "local-onnx"}:
+                from .embedding_retrieval import (
+                    DEFAULT_ONNX_MODEL_FILE,
+                    DEFAULT_ONNX_REPO,
+                    DEFAULT_ONNX_REVISION,
+                    LocalOnnxEmbeddingBackend,
+                )
+                cache_dir = Path(os.getenv(
+                    "EMBEDDING_MODEL_ROOT",
+                    str(PROJECT_ROOT / "data" / "models" / "embeddings"),
+                )).resolve()
+                _EMBEDDING_MODEL = LocalOnnxEmbeddingBackend(
+                    cache_dir,
+                    repo_id=os.getenv("EMBEDDING_MODEL_REPO", DEFAULT_ONNX_REPO),
+                    revision=os.getenv("EMBEDDING_MODEL_REVISION", DEFAULT_ONNX_REVISION),
+                    model_file=os.getenv("EMBEDDING_MODEL_FILE", DEFAULT_ONNX_MODEL_FILE),
+                    allow_download=env_flag("EMBEDDING_ALLOW_DOWNLOAD", True),
+                    cpu_threads=int(os.getenv("EMBEDDING_CPU_THREADS", "2")),
+                    batch_size=int(os.getenv("EMBEDDING_BATCH_SIZE", "32")),
+                )
+                return _EMBEDDING_MODEL
+            if SentenceTransformer is None:
+                return None
             model_name = os.getenv(
                 "EMBEDDING_MODEL",
                 "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
             )
-            _EMBEDDING_MODEL = SentenceTransformer(model_name)
+            cache_dir = Path(os.getenv(
+                "EMBEDDING_MODEL_ROOT",
+                str(PROJECT_ROOT / "data" / "models" / "embeddings"),
+            )).resolve()
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            allow_download = env_flag("EMBEDDING_ALLOW_DOWNLOAD", True)
+            try:
+                import torch
+                torch.set_num_threads(max(1, int(os.getenv("EMBEDDING_CPU_THREADS", "2"))))
+            except Exception:
+                pass
+            _EMBEDDING_MODEL = SentenceTransformer(
+                model_name,
+                cache_folder=str(cache_dir),
+                model_kwargs={"local_files_only": not allow_download},
+            )
         except Exception:
             _EMBEDDING_LOAD_FAILED = True
             logger.exception("Unable to load the embedding model")
@@ -206,8 +249,18 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
     if model is None:
         return []
     try:
-        return model.encode(texts, normalize_embeddings=True).tolist()
+        batch_size = max(1, int(os.getenv("EMBEDDING_BATCH_SIZE", "32")))
+        backend = os.getenv("EMBEDDING_BACKEND", "sentence-transformers").strip().lower()
+        if backend in {"onnx", "bge-onnx", "local-onnx"}:
+            return model.encode(texts).tolist()
+        return model.encode(
+            texts,
+            batch_size=batch_size,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        ).tolist()
     except Exception:
+        logger.exception("Unable to encode embedding texts")
         return []
 
 
@@ -242,13 +295,30 @@ def get_qdrant_client() -> Any | None:
         return None
 
 
-def ensure_qdrant_collection(collection_name: str = "video_evidence", vector_size: int = 384) -> None:
+def ensure_qdrant_collection(
+    collection_name: str = "video_evidence",
+    vector_size: int | None = None,
+) -> None:
     client = get_qdrant_client()
     if client is None:
         return
+    if vector_size is None:
+        model = get_embedding_model()
+        if model is None:
+            return
+        vectors = embed_texts(["dimension probe"])
+        if not vectors:
+            return
+        vector_size = len(vectors[0])
     try:
-        client.get_collection(collection_name)
-        return
+        collection = client.get_collection(collection_name)
+        configured = getattr(collection.config.params.vectors, "size", None)
+        if configured is None or int(configured) == int(vector_size):
+            return
+        # A model change (MiniLM 384 -> BGE 512) invalidates old vectors, but
+        # the source evidence remains authoritative in MySQL and is rebuilt
+        # on the next sync.
+        client.delete_collection(collection_name)
     except Exception:
         pass
     try:
@@ -265,15 +335,6 @@ def sync_evidence_to_qdrant(video_id: str | None = None) -> None:
     if client is None:
         return
     try:
-        ensure_qdrant_collection()
-        if video_id is not None:
-            client.delete(
-                collection_name="video_evidence",
-                points_selector={
-                    "filter": {"must": [{"key": "video_id", "match": {"value": video_id}}]}
-                },
-                wait=True,
-            )
         with get_connection() as connection:
             rows = connection.execute(
                 "SELECT id, video_id, start_seconds, end_seconds, text, source FROM evidence "
@@ -286,6 +347,15 @@ def sync_evidence_to_qdrant(video_id: str | None = None) -> None:
         vectors = embed_texts(texts)
         if not vectors:
             return
+        ensure_qdrant_collection(vector_size=len(vectors[0]))
+        if video_id is not None:
+            client.delete(
+                collection_name="video_evidence",
+                points_selector={
+                    "filter": {"must": [{"key": "video_id", "match": {"value": video_id}}]}
+                },
+                wait=True,
+            )
         points = [
             {
                 "id": row["id"],
@@ -311,10 +381,10 @@ def search_qdrant(question: str, video_id: str | None, limit: int = 5) -> list[E
     if client is None:
         return []
     try:
-        ensure_qdrant_collection()
         vectors = embed_texts([question])
         if not vectors:
             return []
+        ensure_qdrant_collection(vector_size=len(vectors[0]))
         query_filter = None
         if video_id is not None:
             query_filter = {"must": [{"key": "video_id", "match": {"value": video_id}}]}

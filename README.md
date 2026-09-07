@@ -21,8 +21,8 @@
 |------|------|
 | 后端框架 | FastAPI + Uvicorn |
 | Agent 框架 | LangGraph |
-| 向量数据库 | Qdrant (in-memory mode) |
-| 文本向量化 | sentence-transformers (multilingual-MiniLM-L12-v2) |
+| 向量数据库 | Qdrant（Docker 持久化卷） |
+| 文本向量化 | BGE-small-zh-v1.5 INT8 ONNX（CPU） |
 | 视频处理 | FFmpeg |
 | 语音转写 | faster-whisper (Tiny model, CPU-optimized) |
 | 持久化存储 | SQLite |
@@ -39,6 +39,8 @@
 cd backend
 pip install -r requirements.txt
 Copy-Item .env.example .env
+python -m alembic upgrade head
+python scripts/check_database.py
 # 编辑 .env，填写 DEEPSEEK_API_KEY 和 DEEPSEEK_MODEL
 python -m pytest -q              # 运行测试（不调用真实 DeepSeek）
 uvicorn tracelens.main:app --reload --port 9090
@@ -63,6 +65,32 @@ npm run dev
 ```
 
 打开 http://127.0.0.1:5173 使用工作台。
+
+### 一键完整容器栈（建议在本机基础设施验证完成后使用）
+
+根目录的 `docker-compose.yml` 会同时启动 MySQL、Redis、Qdrant、RocketMQ、数据库迁移、API、Linux Worker 和 Nginx 前端。浏览器只需要访问 `http://127.0.0.1:8080`；API、数据库和消息队列不会直接暴露给浏览器。
+
+首次切换前，先确认 `backend/.env` 已填写真实的 `DEEPSEEK_API_KEY` 和高强度 `JWT_SECRET`。当前若正在运行 `docker-compose.infra.yml`，它会占用 Redis/Qdrant 的 7000/7001 端口；请先执行下列命令停止旧的基础设施容器（不加 `-v`，已有 Docker 数据卷不会删除），再启动完整栈：
+
+```powershell
+docker compose -f docker-compose.infra.yml down
+docker compose up --build -d
+docker compose ps
+```
+
+完整栈中的 MySQL 是 Docker 自己的数据卷，和你当前 Windows 本机 `3306` 上的 MySQL 是两套独立数据。为避免端口冲突，它只映射到宿主机 `3307`，而 API 在容器内部通过 `mysql:3306` 连接它。第一次启动会自动运行 Alembic 迁移；查看状态可用：
+
+```powershell
+docker compose logs -f migrate api worker
+```
+
+如果你的网络可以直接访问 Docker Hub，可在启动前设置 `DOCKER_IMAGE_REGISTRY=docker.io`；默认使用已验证的 `docker.m.daocloud.io` 加速源。这个设置只影响项目镜像构建，不会修改 Docker Desktop 的全局镜像配置。
+
+后端镜像默认使用 `mirrors.aliyun.com` 下载 Debian 系统依赖，并对偶发的 502 做三次重试。网络可直连 Debian 时，可设置 `DEBIAN_MIRROR=deb.debian.org`。默认运行的是 CPU ONNX 向量模型，不会下载 PyTorch/GPU 组件；只有显式改用旧的 `sentence-transformers` 后，才需要额外安装 `backend/requirements-legacy-embeddings.txt`。
+
+Windows 无法运行 RocketMQ 的 Python 客户端，所以此前本机 API 会退回线程池；完整容器栈中的 `worker` 是 Linux，能够真正消费 RocketMQ 任务。这正是容器化在这个项目里最实际的价值之一。
+
+完整栈默认使用参考项目同款的固定版本 BGE-small-zh-v1.5 INT8 ONNX 模型。模型不写入 Git，也不打进镜像，而是首次运行时保存到 `app_data` volume；如果模型下载失败，系统会继续使用关键词/上下文检索，数据库和 API 不会因此停止。
 
 ## 📋 API 端点
 
@@ -354,8 +382,8 @@ def build_agent_graph():
 
 - [x] 多轮对话支持（SQLite 会话历史管理）
 - [ ] 检索结果重排序层（使用小模型）
-- [ ] Qdrant 持久化存储配置
-- [ ] Docker 完整部署镜像
+- [x] Qdrant 持久化存储配置
+- [x] Docker 本地完整运行镜像
 - [ ] 自动评估框架（NDCG、F1 等指标）
 - [ ] 支持多种 LLM（OpenAI、本地模型等）
 - [ ] 前端实时流式输出
